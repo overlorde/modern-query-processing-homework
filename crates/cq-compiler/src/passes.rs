@@ -10,12 +10,13 @@
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 
-use cq_ir::{cq, index_requirements, iterator_pipeline, relational_plan, rust_access_plan};
+use cq_ir::{
+    cq, index_requirements, iterator_pipeline, relational_plan, rust_access_plan, symbol_name,
+};
 
 use crate::pass_contracts;
 
 /// Basic Homework 1: lower a CQ to canonical named relational algebra.
-#[allow(unreachable_code, clippy::diverging_sub_expression)]
 #[contracts::contract(
     debug_requires(
         cq::contract::well_formed(source),
@@ -36,7 +37,78 @@ use crate::pass_contracts;
 )]
 pub fn compile_cq(source: &cq::Module) -> syn::Result<relational_plan::Module> {
     // HOMEWORK 1: construct the complete canonical RelationalPlan.
-    todo!("Homework 1: implement CQ -> RelationalPlan")
+    let program = &source.program;
+
+    let mut definitons = Vec::<TokenStream>::new();
+    let mut next = 0usize;
+    let mut current: Option<syn::Ident> = None;
+
+    for item in &program.query.body {
+        let cq::BodyItem::Positive { atom } = item;
+
+        let mut found = None;
+
+        for input in program.inputs.iter() {
+            if symbol_name(&input.name) == symbol_name(&atom.relation) {
+                found = Some(input);
+                break;
+            }
+        }
+
+        let Some(declaration) = found else {
+            return Err(syn::Error::new_spanned(
+                atom,
+                format!("input relation `{}` is not declared", atom.relation),
+            ));
+        };
+
+        let mut mapping = Vec::new();
+
+        for i in 0..atom.variables.len() {
+            let variable = &atom.variables[i];
+            let column = &declaration.columns[i].name;
+
+            mapping.push(quote! {#column -> #variable});
+        }
+
+        let relation = &atom.relation;
+        let renamed = next_result(&mut next);
+        definitons.push(quote! {#renamed = rename #relation {#(#mapping),*};});
+
+        match current {
+            Some(left) => {
+                let joined = next_result(&mut next);
+                definitons.push(quote! {#joined = natural_join #left with #renamed;});
+                current = Some(joined);
+            }
+            None => {
+                current = Some(renamed);
+            }
+        }
+    }
+
+    let joined = match current {
+        Some(joined) => joined,
+        None => {
+            return Err(syn::Error::new_spanned(
+                program,
+                "the body of the query is empty",
+            ));
+        }
+    };
+
+    let projected = next_result(&mut next);
+    let head = &program.query.head;
+    let keep = &head.variables;
+    definitons.push(quote! {#projected = project #joined keep {#keep};});
+
+    syn::parse2(quote! {
+        #program
+        relational {
+            #(#definitons)*
+            output #projected as #head.
+        }
+    })
 }
 
 /// Basic Homework 2: add the exact equality-index overlay to a logical plan.
@@ -209,6 +281,12 @@ fn lower_operator(
             (stream, definition)
         }
     }
+}
+
+fn next_result(next_result_number: &mut usize) -> syn::Ident {
+    let result = format_ident!("r{}", *next_result_number, span = Span::mixed_site());
+    *next_result_number += 1;
+    result
 }
 
 fn next_stream(next_stream_number: &mut usize) -> syn::Ident {
