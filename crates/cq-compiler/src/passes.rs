@@ -106,7 +106,7 @@ pub fn compile_cq(source: &cq::Module) -> syn::Result<relational_plan::Module> {
         #program
         relational {
             #(#definitons)*
-            output #projected as #head.
+            output #projected as #head;
         }
     })
 }
