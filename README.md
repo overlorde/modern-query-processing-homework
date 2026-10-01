@@ -128,4 +128,12 @@ cargo check -p cq-workloads --features compiled-queries --locked
 cargo xtask differential all tiny --scenario all
 ```
 
+Enabling the feature before all three passes return `Ok` fails with many
+errors in files the homework never edits. Each `workload_query!` invocation
+runs the three passes at expansion time, so an unimplemented `todo!` panics
+inside the proc macro, that invocation emits no items, and the catalog then
+reports missing `module` and `RUST_PATH` values across the whole corpus. The
+incomplete pass is not named in that output. Use
+`cargo xtask explain <case> --through <stage>` until the passes are finished.
+
 The checked-in toolchain pins Rust 1.97.1 with `rustfmt` and `clippy`.

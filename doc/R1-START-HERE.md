@@ -373,6 +373,14 @@ cargo test -p cq-workloads --features compiled-queries
 cargo xtask golden all tiny --scenario all
 ```
 
+Enabling the feature before all three passes return `Ok` fails with many
+errors in files the homework never edits. Each `workload_query!` invocation
+runs the three passes at expansion time, so an unimplemented `todo!` panics
+inside the proc macro, that invocation emits no items, and the catalog then
+reports missing `module` and `RUST_PATH` values across the whole corpus. The
+incomplete pass is not named in that output. Use
+`cargo xtask explain <case> --through <stage>` until the passes are finished.
+
 Use `cargo xtask explain <case> --through <stage>` during these focused tests
 to retain the last successful whole-program artifact for inspection.
 
