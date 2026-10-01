@@ -7,6 +7,9 @@
 //! pass first exposes a left-deep iterator plan; a separate semantic lowering
 //! chooses the concrete lazy Rust iterator adapters and returns `syn::Expr`.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::{collections::HashMap, vec};
+
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 
@@ -15,6 +18,14 @@ use cq_ir::{
 };
 
 use crate::pass_contracts;
+
+pub struct map_val_struct {
+    // Kept as the original Ident so raw names like `r#type` survive to output.
+    pub relation: syn::Ident,
+    pub source: Vec<String>,
+    pub target: Vec<String>,
+    pub is_rename: bool,
+}
 
 /// Basic Homework 1: lower a CQ to canonical named relational algebra.
 #[contracts::contract(
@@ -130,10 +141,166 @@ pub fn compile_cq(source: &cq::Module) -> syn::Result<relational_plan::Module> {
         !pass_contracts::basic_left_deep_plan(source) -> ret.is_err()
     ),
 )]
+
 pub fn compile_relational_plan(
     source: &relational_plan::Module,
 ) -> syn::Result<index_requirements::Module> {
-    todo!("later homework: implement RelationalPlan -> IndexRequirements")
+    let mut stream_map: HashMap<String, map_val_struct> = HashMap::new();
+    let relational_plan = &source;
+
+    let mut ans: Vec<TokenStream> = Vec::new();
+    // Every (relation, columns) pair already emitted. Lives outside the loop so
+    // two joins asking for the same index only produce one requirement.
+    let mut seen: BTreeSet<(String, Vec<i32>)> = BTreeSet::new();
+    for definition in &source.plan.definitions {
+        match &definition.operator {
+            relational_plan::Operator::Rename(rename) => {
+                //eprintln!("Rename: {:?}", rename.relation.to_string());
+                let mut source_vec = Vec::new();
+                let mut target_vec = Vec::new();
+                for mapping in &rename.mapping {
+                    // symbol_name strips the raw `r#` prefix, so `r#x` and `x`
+                    // compare as the same variable later on.
+                    source_vec.push(symbol_name(&mapping.source));
+                    target_vec.push(symbol_name(&mapping.target));
+                }
+                stream_map.insert(
+                    symbol_name(&definition.result),
+                    map_val_struct {
+                        relation: rename.relation.clone(),
+                        source: source_vec,
+                        target: target_vec,
+                        is_rename: true,
+                    },
+                );
+            }
+            relational_plan::Operator::NaturalJoin(join) => {
+                let mut new_source_vec: Vec<String> = Vec::new();
+                let mut new_target_vec: Vec<String> = Vec::new();
+                let mut shared_var: Vec<String> = Vec::new();
+
+                /*
+                eprintln!("NaturalJoin left: {:?}", join.left.to_string());
+
+                eprintln!(
+                    "left stream map relation : {}",
+                    stream_map.get(&join.left.to_string()).unwrap().relation,
+                );
+                */
+                let left_key = symbol_name(&join.left);
+                let right_key = symbol_name(&join.right);
+
+                let left_entry = match stream_map.get(&left_key) {
+                    Some(entry) => entry,
+                    None => {
+                        return Err(syn::Error::new_spanned(join, "error"));
+                    }
+                };
+                let right_entry = match stream_map.get(&right_key) {
+                    Some(entry) => entry,
+                    None => {
+                        return Err(syn::Error::new_spanned(join, "error"));
+                    }
+                };
+
+                // only a direct rename names a declared relation with real
+                // column position, an intermediate join result has neither.
+
+                if !right_entry.is_rename {
+                    return Err(syn::Error::new_spanned(
+                        join,
+                        "each joins right op direct rename",
+                    ));
+                }
+
+                for item in &left_entry.target {
+                    if right_entry.target.contains(item) {
+                        shared_var.push(item.to_string());
+                    }
+                }
+
+                // Key is the relation's symbol name; the Ident rides along so the
+                // emitted requirement keeps the original spelling.
+                let mut m: BTreeMap<String, (syn::Ident, Vec<i32>)> = BTreeMap::new();
+
+                for item in &shared_var {
+                    for (positon, name) in right_entry.target.iter().enumerate() {
+                        if item == name {
+                            let relation = right_entry.relation.clone();
+
+                            m.entry(symbol_name(&relation))
+                                .or_insert_with(|| (relation, Vec::new()))
+                                .1
+                                .push(positon as i32);
+                        }
+                    }
+                }
+
+                // now we need to create a new stream map for the result of the join
+
+                for item in &left_entry.target {
+                    if shared_var.contains(item) {
+                        continue;
+                    }
+                    new_target_vec.push(item.to_string());
+                }
+
+                for item in &shared_var {
+                    new_target_vec.push(item.to_string());
+                }
+
+                for item in &right_entry.target {
+                    if shared_var.contains(item) {
+                        continue;
+                    }
+                    new_target_vec.push(item.to_string());
+                }
+
+                for (position, item) in new_target_vec.iter().enumerate() {
+                    //eprintln!("{}->{} ", position, item);
+                    new_source_vec.push(format!("c{}", position.to_string()));
+                }
+
+                stream_map.insert(
+                    symbol_name(&definition.result),
+                    map_val_struct {
+                        relation: definition.result.clone(),
+                        source: new_source_vec,
+                        target: new_target_vec,
+                        is_rename: false,
+                    },
+                );
+
+                for x in m.iter() {
+                    let rltn = &x.1.0;
+                    let mut v = x.1.1.clone();
+                    v.sort();
+
+                    let mut columns: Vec<syn::Index> = Vec::new();
+                    for position in &v {
+                        columns.push(syn::Index::from(*position as usize));
+                    }
+
+                    // insert returns false when this exact index was already emitted.
+                    if seen.insert((symbol_name(rltn), v.clone())) {
+                        ans.push(quote! {#rltn[#(#columns),*];});
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        //eprintln!("semi_token: {:?}", definition.semi_token);
+    }
+
+    let generated = quote! {
+        #source
+        indexes{
+            #(#ans)*
+        }
+    };
+    //eprintln!("{}", generated);
+    syn::parse2(generated)
 }
 
 /// Basic Homework 3: lower the required indexed join to staged, ordinary Rust.
@@ -155,6 +322,40 @@ pub fn compile_relational_plan(
     debug_ensures(!pass_contracts::physical_input_is_supported(source) -> ret.is_err()),
 )]
 pub fn compile_index_requirements(source: &index_requirements::Module) -> syn::Result<syn::File> {
+    // source indexes
+    // clear out the struct
+
+    for declaration in &source.relational_plan.program.inputs {
+        let m = &declaration.name;
+        eprintln!(" relation: {}", quote!(#m));
+    }
+
+    for requirement in &source.indexes {
+        let mut columns = Vec::new();
+
+        for column in &requirement.key_columns {
+            columns.push(column.index);
+        }
+        eprintln!("Index: {} {:?}", requirement.relation, columns);
+    }
+
+    for definition in &source.relational_plan.plan.definitions {
+        eprintln!("Plan: {}", quote!(#definition));
+    }
+    /*
+        for requirement in &source.indexes {
+            for definition in &source.relational_plan.program.inputs {
+                if (symbol_name(&requirement.relation) == symbol_name(&definition.name)) {
+                    for (position, column) in definition.columns.iter().enumerate() {
+                        let ty = &column.ty;
+                        eprintln!("{:?} -> {:?}", position, column);
+                        eprintln!("{}", quote!(#ty));
+                        eprintln!("----------------");
+                    }
+                }
+            }
+        }
+    */
     todo!("later homework: implement IndexRequirements -> staged Rust")
 }
 
